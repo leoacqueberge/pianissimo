@@ -58,13 +58,13 @@ def maybe_trim_input(input_path, output_dir, start, end):
     return out_path
 
 
-def run_separation(input_path, output_dir):
+def run_separation(input_path, output_dir, stem_name=None):
     from demucs.separate import main as demucs_main
 
     os.makedirs(output_dir, exist_ok=True)
     demucs_main(["--mp3", "-n", "htdemucs", "-o", output_dir, input_path])
 
-    name = os.path.splitext(os.path.basename(input_path))[0]
+    name = stem_name or os.path.splitext(os.path.basename(input_path))[0]
     stem_dir = os.path.join(output_dir, "htdemucs", name)
     other_stem = os.path.join(stem_dir, "other.mp3")
     log("Stems saved to: %s" % stem_dir)
@@ -122,6 +122,7 @@ def main():
         log("ERROR: input file not found: %s" % args.input)
         sys.exit(2)
 
+    original_name = os.path.splitext(os.path.basename(args.input))[0]
     input_path = args.input
     if args.start is not None or args.end is not None:
         input_path = maybe_trim_input(args.input, args.output_dir, args.start, args.end)
@@ -129,7 +130,9 @@ def main():
     other_stem = None
     if args.mode in ("both", "separate"):
         log("STEP:Step 1: Separating stems with Demucs...")
-        other_stem = run_separation(input_path, args.output_dir)
+        other_stem = run_separation(
+            input_path, args.output_dir, stem_name=original_name
+        )
 
     if args.mode in ("both", "transcribe"):
         log("STEP:Step 2: Transcribing piano...")

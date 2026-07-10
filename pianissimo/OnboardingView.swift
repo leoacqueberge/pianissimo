@@ -9,7 +9,7 @@ struct OnboardingView: View {
     @Binding var isPresented: Bool
     @State private var page = 0
 
-    private let theme = HomeTheme.shared
+    @Environment(\.homeTheme) private var theme
 
     private let pages: [(icon: String, title: String, body: String)] = [
         (
@@ -44,6 +44,7 @@ struct OnboardingView: View {
                 VStack(spacing: 10) {
                     Text(pages[page].title)
                         .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(theme.text)
                         .multilineTextAlignment(.center)
                     Text(pages[page].body)
                         .font(.body)

@@ -13,6 +13,8 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @AppStorage("isDarkTheme") private var isDarkTheme = false
+    @AppStorage("audioSourceType") private var audioSourceRaw = AudioSourceType.mixed.rawValue
 
     @State private var selectedFileURL: URL? = nil
     @State private var isTargeted = false
@@ -31,9 +33,14 @@ struct ContentView: View {
     @State private var consoleOutput: String = ""
     @State private var showLogs = false
 
-    private let theme = HomeTheme.shared
+    private var theme: HomeTheme { HomeTheme(isDark: isDarkTheme) }
     private let windowWidth: CGFloat = 900
     private let windowHeight: CGFloat = 540
+
+    private var audioSource: AudioSourceType {
+        get { AudioSourceType(rawValue: audioSourceRaw) ?? .mixed }
+        nonmutating set { audioSourceRaw = newValue.rawValue }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -51,11 +58,14 @@ struct ContentView: View {
         }
         .frame(minWidth: windowWidth, maxWidth: windowWidth, minHeight: windowHeight, maxHeight: windowHeight)
         .background(theme.background)
+        .containerBackground(theme.background, for: .window)
+        .environment(\.homeTheme, theme)
         .onAppear {
             NotificationManager.requestAuthorization()
         }
         .sheet(isPresented: onboardingBinding) {
             OnboardingView(isPresented: onboardingBinding)
+                .environment(\.homeTheme, theme)
         }
         .onChange(of: selectedFileURL) { _, newURL in
             if let url = newURL {
@@ -65,6 +75,10 @@ struct ContentView: View {
             } else {
                 resetFileState()
             }
+        }
+        .onChange(of: useSegment) { _, enabled in
+            guard enabled, let duration = fileDuration else { return }
+            clampSegment(to: duration)
         }
         .onChange(of: appMode) { _, newMode in
             if newMode == .playerOnly {
@@ -121,6 +135,16 @@ struct ContentView: View {
                         return true
                     }
 
+                    if selectedFileURL != nil, !isProcessing {
+                        AudioSourcePicker(
+                            selection: Binding(
+                                get: { audioSource },
+                                set: { audioSourceRaw = $0.rawValue }
+                            ),
+                            disabled: isProcessing
+                        )
+                    }
+
                     if selectedFileURL != nil, !isProcessing, let duration = fileDuration {
                         AudioSegmentEditor(
                             duration: duration,
@@ -149,6 +173,8 @@ struct ContentView: View {
             .padding(.top, 20)
             .padding(.bottom, 12)
         }
+        .scrollContentBackground(.hidden)
+        .background(theme.background)
         .frame(minWidth: 400, maxWidth: 400, maxHeight: .infinity)
     }
 
@@ -158,6 +184,7 @@ struct ContentView: View {
                 if isProcessing || processingPhase == .failed || processingPhase == .done {
                     PipelineTimeline(
                         mode: appMode,
+                        sourceType: audioSource,
                         phase: processingPhase,
                         currentMessage: currentStepMessage
                     )
@@ -177,6 +204,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 499, maxWidth: 499, maxHeight: .infinity)
+        .background(theme.background)
         .animation(.easeInOut(duration: 0.25), value: showLogs)
     }
 
@@ -188,6 +216,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(currentStepMessage)
                         .font(.subheadline.weight(.medium))
+                        .foregroundStyle(theme.text)
                     if let duration = fileDuration {
                         Text("estimated time: ~\(estimatedMinutes) min · \(PianissimoFormatters.formatTime(processingDuration(duration))) of audio")
                             .font(.caption)
@@ -204,6 +233,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Ready to start")
                         .font(.subheadline.weight(.medium))
+                        .foregroundStyle(theme.text)
                     Text("~\(estimatedMinutes) min estimated")
                         .font(.caption)
                         .foregroundStyle(theme.subtleText)
@@ -215,14 +245,25 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(theme.accent)
                 .controlSize(.large)
-                .disabled(useSegment && fileDuration == nil)
+                .disabled(useSegment && (fileDuration == nil || segmentEnd - segmentStart < SegmentLimits.minDuration))
             } else {
                 Text(currentStepMessage)
                     .font(.subheadline)
                     .foregroundStyle(processingPhase == .failed ? .red : theme.subtleText)
                 Spacer()
             }
+
+            Button {
+                isDarkTheme.toggle()
+            } label: {
+                Image(systemName: isDarkTheme ? "sun.max.fill" : "moon.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(theme.subtleText)
+            }
+            .buttonStyle(.plain)
+            .help(isDarkTheme ? "Switch to light theme" : "Switch to dark theme")
         }
+        .background(theme.background)
     }
 
     private var estimatedMinutes: Int {
@@ -230,12 +271,22 @@ struct ContentView: View {
             duration: fileDuration ?? 0,
             useSegment: useSegment,
             segmentStart: segmentStart,
-            segmentEnd: segmentEnd
+            segmentEnd: segmentEnd,
+            sourceType: audioSource
         )
     }
 
     private func processingDuration(_ total: Double) -> Double {
         useSegment ? max(0, segmentEnd - segmentStart) : total
+    }
+
+    private func clampSegment(to duration: Double) {
+        let minLen = SegmentLimits.minDuration
+        segmentStart = min(max(0, segmentStart), max(0, duration - minLen))
+        segmentEnd = min(max(segmentStart + minLen, segmentEnd), duration)
+        if segmentEnd - segmentStart < minLen {
+            segmentEnd = min(duration, segmentStart + minLen)
+        }
     }
 
     private func resetFileState() {
@@ -266,6 +317,7 @@ struct ContentView: View {
                         fileDuration = seconds
                         segmentStart = 0
                         segmentEnd = min(60, seconds)
+                        clampSegment(to: seconds)
                         processingPhase = .idle
                         currentStepMessage = "Ready — set the portion, then start"
                     } else {
@@ -341,6 +393,20 @@ struct ContentView: View {
         guard appMode != .playerOnly else { return }
         guard let fileURL = selectedFileURL else { return }
         guard !isProcessing else { return }
+        if useSegment {
+            guard let duration = fileDuration else { return }
+            let segmentLength = segmentEnd - segmentStart
+            guard segmentLength >= SegmentLimits.minDuration else {
+                appendLog("Segment too short — select at least \(Int(SegmentLimits.minDuration)) seconds.")
+                currentStepMessage = "Segment too short (min \(Int(SegmentLimits.minDuration)) s)."
+                return
+            }
+            guard segmentStart >= 0, segmentEnd <= duration, segmentStart < segmentEnd else {
+                appendLog("Invalid segment range.")
+                currentStepMessage = "Invalid segment range."
+                return
+            }
+        }
         guard let resourceURL = Bundle.main.resourceURL else {
             appendLog("Application resources not found.")
             return
@@ -363,10 +429,11 @@ struct ContentView: View {
         processingPhase = .preparing
         currentStepMessage = "Preparing..."
 
-        let mode = appMode.engineMode
+        let mode = audioSource.engineMode
         let outputDir = PianissimoPaths.outputDirectory()
         let baseName = fileURL.deletingPathExtension().lastPathComponent
         let tempMidiURL = outputDir.appendingPathComponent("\(baseName)_Piano.mid")
+        let expectsStem = audioSource == .mixed
 
         DispatchQueue.global(qos: .userInitiated).async {
             var arguments = [
@@ -410,10 +477,12 @@ struct ContentView: View {
                         self.appendLog("Processing completed successfully.")
                         NotificationManager.notify(title: "Pianissimo", body: "MIDI transcription complete")
                         let otherStemURL = outputDir.appendingPathComponent("htdemucs/\(baseName)/other.mp3")
+                        let companion = expectsStem && FileManager.default.fileExists(atPath: otherStemURL.path)
+                            ? otherStemURL : nil
                         self.promptSaveMIDI(
                             producedAt: tempMidiURL,
                             suggestedName: "\(baseName)_Piano.mid",
-                            companionAudio: FileManager.default.fileExists(atPath: otherStemURL.path) ? otherStemURL : nil
+                            companionAudio: companion
                         )
                     }
                 } else {
@@ -439,7 +508,7 @@ struct ContentView: View {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.midi]
         panel.nameFieldStringValue = suggestedName
-        panel.directoryURL = PianissimoPaths.outputDirectory()
+        panel.directoryURL = PianissimoPaths.musicDirectory
         panel.canCreateDirectories = true
         panel.title = "Save MIDI score"
         panel.message = "Choose where to save your MIDI file (the audio stem will be saved alongside it)."

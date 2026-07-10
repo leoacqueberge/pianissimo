@@ -122,11 +122,11 @@ struct MIDIPlayerView: View {
     let url: URL?
     var onClose: () -> Void
 
-    @State private var isDark = false
+    @AppStorage("isDarkTheme") private var isDarkTheme = false
     @State private var showGrid = false
 
     private let rates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-    private var palette: PianoPalette { isDark ? .dark : .light }
+    private var palette: PianoPalette { isDarkTheme ? .dark : .light }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -238,9 +238,9 @@ struct MIDIPlayerView: View {
             }
 
             // thème
-            iconButton(isDark ? "sun.max.fill" : "moon.fill",
+            iconButton(isDarkTheme ? "sun.max.fill" : "moon.fill",
                        help: "Light / dark theme") {
-                withAnimation(.easeInOut(duration: 0.2)) { isDark.toggle() }
+                withAnimation(.easeInOut(duration: 0.2)) { isDarkTheme.toggle() }
             }
 
             // fermer
