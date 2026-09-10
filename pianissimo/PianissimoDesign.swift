@@ -8,144 +8,76 @@ import SwiftUI
 // MARK: - App mode
 
 enum AppMode: String, CaseIterable, Identifiable {
-    case full
-    case pianoToMidi
+    case mixedTrack
+    case pianoOnly
     case playerOnly
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .full: return "Full pipeline"
-        case .pianoToMidi: return "Piano to MIDI"
+        case .mixedTrack: return "From a song"
+        case .pianoOnly: return "From piano"
         case .playerOnly: return "MIDI player"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .full: return "Audio → MIDI → player"
-        case .pianoToMidi: return "Transcription only"
-        case .playerOnly: return "Open a MIDI file"
+        case .mixedTrack: return "Isolate piano, then transcribe"
+        case .pianoOnly: return "Piano audio → MIDI"
+        case .playerOnly: return "Open a score"
         }
     }
 
     var icon: String {
         switch self {
-        case .full: return "pianokeys.inverse"
-        case .pianoToMidi: return "waveform"
+        case .mixedTrack: return "person.wave.2.fill"
+        case .pianoOnly: return "pianokeys.inverse"
         case .playerOnly: return "play.rectangle"
-        }
-    }
-
-    var engineMode: String { "both" }
-
-    var opensPlayerOnSuccess: Bool { self == .full }
-
-    func pipelineLabels(sourceType: AudioSourceType) -> [String] {
-        switch (self, sourceType) {
-        case (.full, .mixed):
-            return ["Choose file", "Isolate piano", "Transcribe to MIDI", "Save & play"]
-        case (.full, .pianoOnly):
-            return ["Choose file", "Transcribe to MIDI", "Save & play"]
-        case (.pianoToMidi, .mixed):
-            return ["Choose file", "Isolate piano", "Transcribe to MIDI", "Save"]
-        case (.pianoToMidi, .pianoOnly):
-            return ["Choose file", "Transcribe to MIDI", "Save"]
-        case (.playerOnly, _):
-            return ["Open MIDI", "Practice"]
-        }
-    }
-
-    var pipelineLabels: [String] {
-        pipelineLabels(sourceType: .mixed)
-    }
-
-    var infoSteps: [(icon: String, title: String, detail: String)] {
-        switch self {
-        case .full:
-            return [
-                (
-                    "waveform.badge.minus",
-                    "Isolate the Piano",
-                    "Your song is processed to remove voice and other instruments to keep only the piano track."
-                ),
-                (
-                    "pianokeys",
-                    "Waveform to MIDI",
-                    "The piano track is converted to a MIDI file."
-                ),
-                (
-                    "play.rectangle.on.rectangle",
-                    "Learn and Play",
-                    "The MIDI visualizer opens so you can learn and play your song."
-                )
-            ]
-        case .pianoToMidi:
-            return [
-                (
-                    "waveform.badge.minus",
-                    "Isolate the Piano",
-                    "Your song is processed to remove voice and other instruments to keep only the piano track."
-                ),
-                (
-                    "pianokeys",
-                    "Waveform to MIDI",
-                    "The piano track is converted to a MIDI file and saved to your Music folder."
-                )
-            ]
-        case .playerOnly:
-            return [
-                (
-                    "pianokeys",
-                    "MIDI Visualizer",
-                    "Open a MIDI file to scroll through the score while you play on your keyboard."
-                ),
-                (
-                    "metronome",
-                    "Practice at Your Pace",
-                    "Adjust speed, loop sections, and follow the falling notes."
-                )
-            ]
-        }
-    }
-}
-
-// MARK: - Audio source (mixed vs piano-only)
-
-enum AudioSourceType: String, CaseIterable, Identifiable {
-    case mixed
-    case pianoOnly
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .mixed: return "Mixed track"
-        case .pianoOnly: return "Piano only"
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case .mixed: return "Voice & instruments"
-        case .pianoOnly: return "Skip isolation · faster"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .mixed: return "person.wave.2.fill"
-        case .pianoOnly: return "pianokeys"
         }
     }
 
     var engineMode: String {
         switch self {
-        case .mixed: return "both"
+        case .mixedTrack: return "both"
         case .pianoOnly: return "transcribe"
+        case .playerOnly: return "transcribe"
         }
     }
+
+    var isolatesPiano: Bool { self == .mixedTrack }
+    var opensPlayerOnSuccess: Bool { self != .playerOnly }
+
+    var pipelineLabels: [String] {
+        switch self {
+        case .mixedTrack:
+            return ["Choose file", "Isolate piano", "Transcribe to MIDI", "Save & play"]
+        case .pianoOnly:
+            return ["Choose file", "Transcribe to MIDI", "Save & play"]
+        case .playerOnly:
+            return ["Open MIDI", "Practice"]
+        }
+    }
+
+    func stepIndex(for phase: ProcessingPhase) -> Int {
+        let isolate = isolatesPiano
+        switch phase {
+        case .idle:
+            return 0
+        case .preparing:
+            return 1
+        case .separating:
+            return isolate ? 1 : 1
+        case .transcribing:
+            return isolate ? 2 : 1
+        case .saving, .done:
+            return max(0, pipelineLabels.count - 1)
+        case .failed:
+            return max(0, pipelineLabels.count - 1)
+        }
+    }
+
 }
 
 // MARK: - Processing phase
@@ -199,6 +131,56 @@ extension EnvironmentValues {
     }
 }
 
+// MARK: - Appearance
+
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+
+    static let storageKey = "appAppearance"
+    static let legacyDarkKey = "isDarkTheme"
+
+    static func migrateFromLegacyThemeIfNeeded() {
+        guard UserDefaults.standard.object(forKey: storageKey) == nil else { return }
+        if UserDefaults.standard.bool(forKey: legacyDarkKey) {
+            UserDefaults.standard.set(AppAppearance.dark.rawValue, forKey: storageKey)
+        }
+    }
+}
+
+private struct AppAppearanceModifier: ViewModifier {
+    @AppStorage(AppAppearance.storageKey) private var appearance: AppAppearance = .system
+
+    func body(content: Content) -> some View {
+        content.preferredColorScheme(appearance.colorScheme)
+    }
+}
+
+extension View {
+    func appAppearance() -> some View {
+        modifier(AppAppearanceModifier())
+    }
+}
+
 enum SegmentLimits {
     static let minDuration: Double = 3
 }
@@ -213,16 +195,16 @@ enum PianissimoFormatters {
         return String(format: "%d:%02d", m, s)
     }
 
-    /// Rough CPU estimate. Mixed: Demucs + transcription (~2.5×). Piano only: transcription (~1×).
+    /// Rough estimate. Mixed: Demucs + transcription (~2.5×). Piano only: transcription (~1×).
     static func estimatedMinutes(
         duration: Double,
         useSegment: Bool,
         segmentStart: Double,
         segmentEnd: Double,
-        sourceType: AudioSourceType = .mixed
+        isolatesPiano: Bool
     ) -> Int {
         let effective = useSegment ? max(1, segmentEnd - segmentStart) : max(1, duration)
-        let multiplier = sourceType == .pianoOnly ? 1.0 : 2.5
+        let multiplier = isolatesPiano ? 2.5 : 1.0
         return max(1, Int(ceil((effective / 60.0) * multiplier)))
     }
 }

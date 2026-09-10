@@ -19,12 +19,25 @@ final class RecentFilesStore: ObservableObject {
         midiFiles = load(key: midiKey)
     }
 
+    func exists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
+    func refresh() {
+        audioFiles = audioFiles.filter { exists($0) }
+        midiFiles = midiFiles.filter { exists($0) }
+        save(audioFiles, key: audioKey)
+        save(midiFiles, key: midiKey)
+    }
+
     func addAudio(_ url: URL) {
+        guard exists(url) else { return }
         audioFiles = prepend(url, to: audioFiles)
         save(audioFiles, key: audioKey)
     }
 
     func addMIDI(_ url: URL) {
+        guard exists(url) else { return }
         midiFiles = prepend(url, to: midiFiles)
         save(midiFiles, key: midiKey)
     }

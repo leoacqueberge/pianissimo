@@ -8,6 +8,7 @@ flush) for live display in the app.
 
 import argparse
 import os
+import shutil
 import sys
 
 
@@ -26,8 +27,21 @@ def find_piano_checkpoint(models_dir):
     )
 
 
+def pick_device():
+    """Prefer Apple GPU (MPS), then CUDA, else CPU."""
+    try:
+        import torch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def maybe_trim_input(input_path, output_dir, start, end):
-    """Trim audio between start and end (seconds). Returns the path to process."""
+    """Trim audio between start and end (seconds). Returns (path, trim_dir_or_None)."""
     import librosa
     import soundfile as sf
 
@@ -55,20 +69,32 @@ def maybe_trim_input(input_path, output_dir, start, end):
     audio, sr = librosa.load(input_path, sr=None, offset=start, duration=duration)
     sf.write(out_path, audio, sr)
     log("Trim saved: %s" % out_path)
-    return out_path
+    return out_path, trim_dir
 
 
 def run_separation(input_path, output_dir, stem_name=None):
     from demucs.separate import main as demucs_main
 
     os.makedirs(output_dir, exist_ok=True)
-    demucs_main(["--mp3", "-n", "htdemucs", "-o", output_dir, input_path])
+    model = "htdemucs_6s"
+    demucs_main(["--mp3", "-n", model, "-o", output_dir, input_path])
 
     name = stem_name or os.path.splitext(os.path.basename(input_path))[0]
-    stem_dir = os.path.join(output_dir, "htdemucs", name)
-    other_stem = os.path.join(stem_dir, "other.mp3")
+    stem_dir = os.path.join(output_dir, model, name)
     log("Stems saved to: %s" % stem_dir)
-    return other_stem
+
+    piano = os.path.join(stem_dir, "piano.mp3")
+    if os.path.isfile(piano):
+        log("Using piano stem: %s" % piano)
+        return piano
+
+    other = os.path.join(stem_dir, "other.mp3")
+    if os.path.isfile(other):
+        log("WARNING: piano stem missing, falling back to other: %s" % other)
+        return other
+
+    log("ERROR: no usable stem found in %s" % stem_dir)
+    sys.exit(2)
 
 
 def run_transcription(audio_path, output_midi, models_dir):
@@ -86,9 +112,26 @@ def run_transcription(audio_path, output_midi, models_dir):
 
     os.makedirs(os.path.dirname(os.path.abspath(output_midi)), exist_ok=True)
 
-    log("Transcribing (CPU)... this may take several minutes.")
-    transcriptor = PianoTranscription(device="cpu", checkpoint_path=checkpoint)
-    transcriptor.transcribe(audio, output_midi)
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    device = pick_device()
+    log("Transcribing (%s)... this may take several minutes." % device)
+
+    def transcribe_on(dev):
+        transcriptor = PianoTranscription(device=dev, checkpoint_path=checkpoint)
+        # piano_transcription_inference only .to()'s CUDA devices.
+        if dev not in ("cpu",):
+            transcriptor.model.to(dev)
+        transcriptor.transcribe(audio, output_midi)
+
+    try:
+        transcribe_on(device)
+    except Exception as exc:
+        if device != "cpu":
+            log("GPU transcription failed (%s), retrying on CPU..." % exc)
+            transcribe_on("cpu")
+        else:
+            raise
+
     log("MIDI created: %s" % output_midi)
 
 
@@ -124,25 +167,32 @@ def main():
 
     original_name = os.path.splitext(os.path.basename(args.input))[0]
     input_path = args.input
-    if args.start is not None or args.end is not None:
-        input_path = maybe_trim_input(args.input, args.output_dir, args.start, args.end)
+    trim_dir = None
+    try:
+        if args.start is not None or args.end is not None:
+            input_path, trim_dir = maybe_trim_input(
+                args.input, args.output_dir, args.start, args.end
+            )
 
-    other_stem = None
-    if args.mode in ("both", "separate"):
-        log("STEP:Step 1: Separating stems with Demucs...")
-        other_stem = run_separation(
-            input_path, args.output_dir, stem_name=original_name
-        )
+        other_stem = None
+        if args.mode in ("both", "separate"):
+            log("STEP:Step 1: Isolating the piano with Demucs...")
+            other_stem = run_separation(
+                input_path, args.output_dir, stem_name=original_name
+            )
 
-    if args.mode in ("both", "transcribe"):
-        log("STEP:Step 2: Transcribing piano...")
-        if args.output_midi is None:
-            log("ERROR: --output-midi is required for transcription.")
-            sys.exit(2)
-        audio_for_transcription = other_stem if args.mode == "both" else input_path
-        run_transcription(audio_for_transcription, args.output_midi, models_dir)
+        if args.mode in ("both", "transcribe"):
+            log("STEP:Step 2: Transcribing piano...")
+            if args.output_midi is None:
+                log("ERROR: --output-midi is required for transcription.")
+                sys.exit(2)
+            audio_for_transcription = other_stem if args.mode == "both" else input_path
+            run_transcription(audio_for_transcription, args.output_midi, models_dir)
 
-    log("DONE")
+        log("DONE")
+    finally:
+        if trim_dir and os.path.isdir(trim_dir):
+            shutil.rmtree(trim_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ struct OnboardingView: View {
         ),
         (
             "waveform.path",
-            "Three modes",
-            "Full pipeline, transcription only, or MIDI player: pick what you need before you start."
+            "Three ways in",
+            "From a song, from piano audio, or a MIDI file — pick what you have, then start."
         ),
         (
             "lock.shield",

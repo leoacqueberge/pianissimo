@@ -11,18 +11,18 @@ struct ContentView: View {
     @EnvironmentObject private var appModel: AppModel
     @EnvironmentObject private var recentFiles: RecentFilesStore
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.colorScheme) private var colorScheme
 
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
-    @AppStorage("isDarkTheme") private var isDarkTheme = false
-    @AppStorage("audioSourceType") private var audioSourceRaw = AudioSourceType.mixed.rawValue
 
     @State private var selectedFileURL: URL? = nil
     @State private var isTargeted = false
 
-    @State private var appMode: AppMode = .full
+    @State private var appMode: AppMode = .mixedTrack
     @State private var isProcessing = false
     @State private var processingPhase: ProcessingPhase = .idle
-    @State private var currentStepMessage = "Ready to process"
+    @State private var lastWorkingPhase: ProcessingPhase = .preparing
+    @State private var currentStepMessage = "Drop an audio file to get started."
 
     @State private var fileDuration: Double? = nil
     @State private var useSegment = false
@@ -33,35 +33,73 @@ struct ContentView: View {
     @State private var consoleOutput: String = ""
     @State private var showLogs = false
 
-    private var theme: HomeTheme { HomeTheme(isDark: isDarkTheme) }
-    private let windowWidth: CGFloat = 900
-    private let windowHeight: CGFloat = 540
+    @State private var pipelineRunner = PipelineRunner()
 
-    private var audioSource: AudioSourceType {
-        get { AudioSourceType(rawValue: audioSourceRaw) ?? .mixed }
-        nonmutating set { audioSourceRaw = newValue.rawValue }
+    private var theme: HomeTheme { HomeTheme(isDark: colorScheme == .dark) }
+
+    private var showsPipeline: Bool {
+        isProcessing
+            || processingPhase == .failed
+            || processingPhase == .done
+            || processingPhase == .saving
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
-                leftPanel
-                Rectangle()
-                    .fill(theme.divider)
-                    .frame(width: 1)
-                rightPanel
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    VStack(spacing: 14) {
+                        if showsPipeline {
+                            pipelineContent
+                        } else {
+                            idleContent
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .padding(.bottom, 12)
+                }
+                .scrollContentBackground(.hidden)
+
+                if showLogs {
+                    LogsOverlay(text: $consoleOutput, isPresented: $showLogs)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(.easeInOut(duration: 0.25), value: showLogs)
+
+            if isProcessing {
+                processingBar
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
             }
 
-            bottomBar
-                .padding(.horizontal, 24)
-                .padding(.vertical, 14)
+            HStack {
+                Spacer(minLength: 0)
+                PrivacyChip()
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 4)
+            .padding(.bottom, 16)
         }
-        .frame(minWidth: windowWidth, maxWidth: windowWidth, minHeight: windowHeight, maxHeight: windowHeight)
+        .frame(minWidth: 440, minHeight: 560)
         .background(theme.background)
         .containerBackground(theme.background, for: .window)
         .environment(\.homeTheme, theme)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                SettingsLink {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .help("Settings")
+            }
+        }
         .onAppear {
-            NotificationManager.requestAuthorization()
+            recentFiles.refresh()
         }
         .sheet(isPresented: onboardingBinding) {
             OnboardingView(isPresented: onboardingBinding)
@@ -80,15 +118,6 @@ struct ContentView: View {
             guard enabled, let duration = fileDuration else { return }
             clampSegment(to: duration)
         }
-        .onChange(of: appMode) { _, newMode in
-            if newMode == .playerOnly {
-                selectedFileURL = nil
-                resetFileState()
-                currentStepMessage = "Open a MIDI file or the empty player."
-            } else {
-                currentStepMessage = "Drop an audio file to get started."
-            }
-        }
     }
 
     private var onboardingBinding: Binding<Bool> {
@@ -100,170 +129,151 @@ struct ContentView: View {
 
     // MARK: - Layout
 
-    private var leftPanel: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                ModeCardPicker(selection: $appMode, disabled: isProcessing)
+    private var idleContent: some View {
+        VStack(spacing: 14) {
+            ModeCardPicker(
+                selection: $appMode,
+                disabled: isProcessing,
+                onOpenPlayer: openPlayerWindow
+            )
 
-                if appMode == .playerOnly {
-                    PlayerModePanel(
-                        onOpenMIDI: openMIDIFileSelector,
-                        onOpenEmpty: { openPlayer(with: nil) }
-                    )
-                } else {
-                    AudioDropzone(
-                        selectedFileURL: selectedFileURL,
-                        fileDuration: fileDuration,
-                        isTargeted: isTargeted,
-                        isProcessing: isProcessing,
-                        useSegment: useSegment,
-                        segmentStart: segmentStart,
-                        segmentEnd: segmentEnd,
-                        onTap: openFileSelector
-                    )
-                    .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-                        guard !isProcessing else { return false }
-                        guard let provider = providers.first else { return false }
-                        _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                            if let fileURL = url {
-                                DispatchQueue.main.async {
-                                    self.selectedFileURL = fileURL
-                                    self.appendLog("File selected: \(fileURL.path)")
-                                }
-                            }
-                        }
-                        return true
-                    }
+            AudioDropzone(
+                selectedFileURL: selectedFileURL,
+                fileDuration: fileDuration,
+                isTargeted: isTargeted,
+                isProcessing: isProcessing,
+                useSegment: useSegment,
+                segmentStart: segmentStart,
+                segmentEnd: segmentEnd,
+                onTap: openFileSelector
+            )
+            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                handleFileDrop(providers)
+            }
 
-                    if selectedFileURL != nil, !isProcessing {
-                        AudioSourcePicker(
-                            selection: Binding(
-                                get: { audioSource },
-                                set: { audioSourceRaw = $0.rawValue }
-                            ),
-                            disabled: isProcessing
-                        )
-                    }
-
-                    if selectedFileURL != nil, !isProcessing, let duration = fileDuration {
-                        AudioSegmentEditor(
-                            duration: duration,
-                            useSegment: $useSegment,
-                            start: $segmentStart,
-                            end: $segmentEnd,
-                            waveform: waveformSamples,
-                            estimatedMinutes: estimatedMinutes
-                        )
-                    }
-                }
-
-                RecentFilesSection(
-                    audioFiles: recentFiles.audioFiles,
-                    midiFiles: recentFiles.midiFiles,
-                    onSelectAudio: { url in
-                        selectedFileURL = url
-                    },
-                    onSelectMIDI: { url in
-                        recentFiles.addMIDI(url)
-                        openPlayer(with: url)
-                    }
+            if selectedFileURL != nil, !isProcessing, let duration = fileDuration {
+                AudioSegmentEditor(
+                    duration: duration,
+                    useSegment: $useSegment,
+                    start: $segmentStart,
+                    end: $segmentEnd,
+                    waveform: waveformSamples,
+                    estimatedMinutes: estimatedMinutes
                 )
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-            .padding(.bottom, 12)
-        }
-        .scrollContentBackground(.hidden)
-        .background(theme.background)
-        .frame(minWidth: 400, maxWidth: 400, maxHeight: .infinity)
-    }
 
-    private var rightPanel: some View {
-        ZStack(alignment: .bottom) {
-            Group {
-                if isProcessing || processingPhase == .failed || processingPhase == .done {
-                    PipelineTimeline(
-                        mode: appMode,
-                        sourceType: audioSource,
-                        phase: processingPhase,
-                        currentMessage: currentStepMessage
-                    )
-                } else {
-                    ModeInfoPanel(mode: appMode)
-                }
-            }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 20)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-            if showLogs {
-                LogsOverlay(text: $consoleOutput, isPresented: $showLogs)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 12)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            if selectedFileURL != nil {
+                startButton
             }
         }
-        .frame(minWidth: 499, maxWidth: 499, maxHeight: .infinity)
-        .background(theme.background)
-        .animation(.easeInOut(duration: 0.25), value: showLogs)
     }
 
-    private var bottomBar: some View {
-        HStack(spacing: 12) {
-            if isProcessing {
-                ProgressView()
-                    .controlSize(.small)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(currentStepMessage)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(theme.text)
-                    if let duration = fileDuration {
-                        Text("estimated time: ~\(estimatedMinutes) min · \(PianissimoFormatters.formatTime(processingDuration(duration))) of audio")
-                            .font(.caption)
-                            .foregroundStyle(theme.subtleText)
+    private var pipelineContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let selectedFileURL {
+                Text(selectedFileURL.lastPathComponent)
+                    .font(.caption)
+                    .foregroundStyle(theme.subtleText)
+                    .lineLimit(1)
+            }
+
+            PipelineTimeline(
+                mode: appMode,
+                phase: processingPhase,
+                failedAt: lastWorkingPhase,
+                currentMessage: currentStepMessage
+            )
+
+            if !isProcessing {
+                if processingPhase == .failed {
+                    Button {
+                        startProcessing()
+                    } label: {
+                        Text("Try again")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(theme.accent)
+                    .controlSize(.large)
+                    .disabled(selectedFileURL == nil)
+
+                    Button("Choose another file") {
+                        returnToIdle(clearFile: true)
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(maxWidth: .infinity)
+                    .foregroundStyle(theme.subtleText)
+                } else if processingPhase == .done {
+                    Button("Start over") {
+                        returnToIdle(clearFile: true)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .frame(maxWidth: .infinity)
                 }
-                Spacer()
-                Button(showLogs ? "hide logs" : "show logs") {
-                    withAnimation { showLogs.toggle() }
-                }
-                .buttonStyle(.borderless)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var startButton: some View {
+        VStack(spacing: 8) {
+            Button {
+                startProcessing()
+            } label: {
+                Text("Start")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(theme.accent)
+            .controlSize(.large)
+            .disabled(useSegment && (fileDuration == nil || segmentEnd - segmentStart < SegmentLimits.minDuration))
+
+            Text("About \(estimatedMinutes) min")
                 .font(.caption)
-            } else if appMode != .playerOnly, selectedFileURL != nil {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Ready to start")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(theme.text)
-                    Text("~\(estimatedMinutes) min estimated")
+                .foregroundStyle(theme.subtleText)
+        }
+    }
+
+    private var processingBar: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(currentStepMessage)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(theme.text)
+                if let duration = fileDuration {
+                    Text("Estimated time: ~\(estimatedMinutes) min · \(PianissimoFormatters.formatTime(processingDuration(duration))) of audio")
                         .font(.caption)
                         .foregroundStyle(theme.subtleText)
                 }
-                Spacer()
-                Button("Start") {
-                    startProcessing()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(theme.accent)
-                .controlSize(.large)
-                .disabled(useSegment && (fileDuration == nil || segmentEnd - segmentStart < SegmentLimits.minDuration))
-            } else {
-                Text(currentStepMessage)
-                    .font(.subheadline)
-                    .foregroundStyle(processingPhase == .failed ? .red : theme.subtleText)
-                Spacer()
             }
-
-            Button {
-                isDarkTheme.toggle()
-            } label: {
-                Image(systemName: isDarkTheme ? "sun.max.fill" : "moon.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(theme.subtleText)
+            Spacer()
+            Button(showLogs ? "Hide logs" : "Show logs") {
+                withAnimation { showLogs.toggle() }
             }
-            .buttonStyle(.plain)
-            .help(isDarkTheme ? "Switch to light theme" : "Switch to dark theme")
+            .buttonStyle(.borderless)
+            .font(.caption)
+            Button("Cancel") {
+                pipelineRunner.cancel()
+                currentStepMessage = "Cancelling…"
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(.red)
         }
         .background(theme.background)
+    }
+
+    private func returnToIdle(clearFile: Bool) {
+        processingPhase = .idle
+        showLogs = false
+        currentStepMessage = "Drop an audio file to get started."
+        if clearFile {
+            selectedFileURL = nil
+            resetFileState()
+        }
     }
 
     private var estimatedMinutes: Int {
@@ -272,7 +282,7 @@ struct ContentView: View {
             useSegment: useSegment,
             segmentStart: segmentStart,
             segmentEnd: segmentEnd,
-            sourceType: audioSource
+            isolatesPiano: appMode.isolatesPiano
         )
     }
 
@@ -336,11 +346,47 @@ struct ContentView: View {
     func openPlayer(with url: URL?) {
         if let url { recentFiles.addMIDI(url) }
         appModel.playerURL = url
-        openWindow(id: AppModel.playerWindowID)
+        openWindow(id: AppModel.playerWindowID, value: MIDIPlayerWindow.main)
+    }
+
+    func openPlayerWindow() {
+        openWindow(id: AppModel.playerWindowID, value: MIDIPlayerWindow.main)
+    }
+
+    /// Drop : un .mid/.midi ouvre le lecteur ; sinon le fichier est pris comme audio source.
+    func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !isProcessing else { return false }
+        guard let provider = providers.first else { return false }
+        _ = provider.loadObject(ofClass: URL.self) { url, _ in
+            guard let fileURL = url else { return }
+            DispatchQueue.main.async {
+                self.ingestDroppedFile(fileURL)
+            }
+        }
+        return true
+    }
+
+    func ingestDroppedFile(_ fileURL: URL) {
+        if Self.isMIDIFile(fileURL) {
+            appendLog("MIDI dropped — opening player: \(fileURL.path)")
+            openPlayer(with: fileURL)
+            return
+        }
+
+        selectedFileURL = fileURL
+        appendLog("File selected: \(fileURL.path)")
+    }
+
+    static func isMIDIFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "mid" || ext == "midi" { return true }
+        if let type = UTType(filenameExtension: ext), type.conforms(to: .midi) {
+            return true
+        }
+        return false
     }
 
     func openFileSelector() {
-        guard appMode != .playerOnly else { return }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -352,21 +398,20 @@ struct ContentView: View {
         }
     }
 
-    func openMIDIFileSelector() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.midi]
-        panel.directoryURL = PianissimoPaths.outputDirectory()
-
-        if panel.runModal() == .OK, let url = panel.url {
-            openPlayer(with: url)
-        }
-    }
-
     func appendLog(_ text: String) {
         DispatchQueue.main.async {
             consoleOutput += "[\(timestamp())] \(text)\n"
+        }
+    }
+
+    private func appendEngineOutput(_ output: String) {
+        consoleOutput += output
+        for line in output.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            if let range = line.range(of: "STEP:") {
+                let message = String(line[range.upperBound...])
+                currentStepMessage = message
+                updatePhase(from: message)
+            }
         }
     }
 
@@ -423,82 +468,119 @@ struct ContentView: View {
             return
         }
 
+        NotificationManager.requestAuthorization()
+
         isProcessing = true
         consoleOutput = ""
         showLogs = false
         processingPhase = .preparing
-        currentStepMessage = "Preparing..."
+        lastWorkingPhase = .preparing
+        currentStepMessage = "Preparing…"
 
-        let mode = audioSource.engineMode
+        let mode = appMode.engineMode
         let outputDir = PianissimoPaths.outputDirectory()
         let baseName = fileURL.deletingPathExtension().lastPathComponent
         let tempMidiURL = outputDir.appendingPathComponent("\(baseName)_Piano.mid")
-        let expectsStem = audioSource == .mixed
+        let expectsStem = appMode.isolatesPiano
+        let request = PipelineRequest(
+            pythonURL: pythonURL,
+            scriptURL: scriptURL,
+            inputURL: fileURL,
+            outputDir: outputDir,
+            outputMIDI: mode == "separate" ? nil : tempMidiURL,
+            resourcesURL: engineDir,
+            mode: mode,
+            start: useSegment ? segmentStart : nil,
+            end: useSegment ? segmentEnd : nil
+        )
+
+        let runner = pipelineRunner
+        runner.onOutput = { output in
+            DispatchQueue.main.async {
+                self.appendEngineOutput(output)
+            }
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            var arguments = [
-                scriptURL.path,
-                "--mode", mode,
-                "--input", fileURL.path,
-                "--output-dir", outputDir.path,
-                "--resources", engineDir.path
-            ]
-            if mode != "separate" {
-                arguments += ["--output-midi", tempMidiURL.path]
-            }
-            if self.useSegment {
-                arguments += [
-                    "--start", String(self.segmentStart),
-                    "--end", String(self.segmentEnd)
-                ]
-            }
-
-            let success = runCommandLine(
-                executable: pythonURL.path,
-                arguments: arguments,
-                currentDirectory: outputDir.path
-            )
-
+            let outcome = runner.run(request)
             DispatchQueue.main.async {
-                self.isProcessing = false
-                if success {
-                    self.showLogs = false
-                    NSSound.beep()
-                    self.selectedFileURL = nil
-                    if mode == "separate" {
-                        self.processingPhase = .done
-                        self.currentStepMessage = "Separation complete."
-                        self.appendLog("Stems available at: \(outputDir.path)")
-                        NotificationManager.notify(title: "Pianissimo", body: "Stem separation complete")
-                        NSWorkspace.shared.activateFileViewerSelecting([outputDir])
-                    } else {
-                        self.processingPhase = .saving
-                        self.currentStepMessage = "Saving MIDI..."
-                        self.appendLog("Processing completed successfully.")
-                        NotificationManager.notify(title: "Pianissimo", body: "MIDI transcription complete")
-                        let otherStemURL = outputDir.appendingPathComponent("htdemucs/\(baseName)/other.mp3")
-                        let companion = expectsStem && FileManager.default.fileExists(atPath: otherStemURL.path)
-                            ? otherStemURL : nil
-                        self.promptSaveMIDI(
-                            producedAt: tempMidiURL,
-                            suggestedName: "\(baseName)_Piano.mid",
-                            companionAudio: companion
-                        )
-                    }
-                } else {
-                    self.processingPhase = .failed
-                    self.currentStepMessage = "Processing failed (see console)."
-                    self.appendLog("An error occurred. Check the logs.")
-                    NotificationManager.notify(title: "Pianissimo", body: "Processing failed")
-                    self.showLogs = true
-                    self.selectedFileURL = nil
-                }
+                self.finishProcessing(
+                    outcome,
+                    mode: mode,
+                    outputDir: outputDir,
+                    tempMidiURL: tempMidiURL,
+                    baseName: baseName,
+                    expectsStem: expectsStem
+                )
             }
         }
     }
 
+    private func finishProcessing(
+        _ outcome: PipelineOutcome,
+        mode: String,
+        outputDir: URL,
+        tempMidiURL: URL,
+        baseName: String,
+        expectsStem: Bool
+    ) {
+        isProcessing = false
+        cleanupTrimFolder(in: outputDir)
+
+        switch outcome {
+        case .cancelled:
+            processingPhase = .idle
+            currentStepMessage = "Cancelled. Your file is still ready to run."
+            appendLog("Processing cancelled.")
+            showLogs = false
+        case .failure:
+            lastWorkingPhase = processingPhase == .idle ? .preparing : processingPhase
+            processingPhase = .failed
+            currentStepMessage = "Processing failed (see console)."
+            appendLog("An error occurred. Check the logs.")
+            NotificationManager.notify(title: "Pianissimo", body: "Processing failed")
+            showLogs = true
+        case .success:
+            showLogs = false
+            NSSound.beep()
+            if mode == "separate" {
+                processingPhase = .done
+                currentStepMessage = "Separation complete."
+                appendLog("Stems available at: \(outputDir.path)")
+                NotificationManager.notify(title: "Pianissimo", body: "Stem separation complete")
+                NSWorkspace.shared.activateFileViewerSelecting([outputDir])
+            } else {
+                processingPhase = .saving
+                currentStepMessage = "Saving MIDI…"
+                appendLog("Processing completed successfully.")
+                NotificationManager.notify(title: "Pianissimo", body: "MIDI transcription complete")
+                let companion = expectsStem ? Self.findPianoStem(outputDir: outputDir, baseName: baseName) : nil
+                promptSaveMIDI(
+                    producedAt: tempMidiURL,
+                    suggestedName: "\(baseName)_Piano.mid",
+                    companionAudio: companion
+                )
+            }
+        }
+    }
+
+    static func findPianoStem(outputDir: URL, baseName: String) -> URL? {
+        let candidates = [
+            outputDir.appendingPathComponent("htdemucs_6s/\(baseName)/piano.mp3"),
+            outputDir.appendingPathComponent("htdemucs/\(baseName)/piano.mp3"),
+            outputDir.appendingPathComponent("htdemucs/\(baseName)/other.mp3")
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func cleanupTrimFolder(in outputDir: URL) {
+        let trim = outputDir.appendingPathComponent("_trim", isDirectory: true)
+        try? FileManager.default.removeItem(at: trim)
+    }
+
     func promptSaveMIDI(producedAt sourceURL: URL, suggestedName: String, companionAudio: URL? = nil) {
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            lastWorkingPhase = .saving
             processingPhase = .failed
             currentStepMessage = "MIDI not found after transcription."
             appendLog("MIDI file not found at expected location: \(sourceURL.path)")
@@ -511,7 +593,9 @@ struct ContentView: View {
         panel.directoryURL = PianissimoPaths.musicDirectory
         panel.canCreateDirectories = true
         panel.title = "Save MIDI score"
-        panel.message = "Choose where to save your MIDI file (the audio stem will be saved alongside it)."
+        panel.message = companionAudio == nil
+            ? "Choose where to save your MIDI file."
+            : "Choose where to save your MIDI file (the piano stem will be saved alongside it)."
 
         if panel.runModal() == .OK, let destinationURL = panel.url {
             do {
@@ -529,7 +613,7 @@ struct ContentView: View {
                         try FileManager.default.removeItem(at: audioDest)
                     }
                     try FileManager.default.copyItem(at: audioURL, to: audioDest)
-                    appendLog("Audio stem saved to: \(audioDest.path)")
+                    appendLog("Piano stem saved to: \(audioDest.path)")
                     currentStepMessage = "Saved: \(destinationURL.lastPathComponent) + \(audioDest.lastPathComponent)"
                 } else {
                     currentStepMessage = "Saved: \(destinationURL.lastPathComponent)"
@@ -540,6 +624,7 @@ struct ContentView: View {
                     openPlayer(with: destinationURL)
                 }
             } catch {
+                lastWorkingPhase = .saving
                 processingPhase = .failed
                 currentStepMessage = "Could not save file."
                 appendLog("Save error: \(error.localizedDescription)")
@@ -553,12 +638,66 @@ struct ContentView: View {
             }
         }
     }
+}
 
-    func runCommandLine(executable: String, arguments: [String], currentDirectory: String) -> Bool {
+// MARK: - Embedded Python runner
+
+struct PipelineRequest: Sendable {
+    var pythonURL: URL
+    var scriptURL: URL
+    var inputURL: URL
+    var outputDir: URL
+    var outputMIDI: URL?
+    var resourcesURL: URL
+    var mode: String
+    var start: Double?
+    var end: Double?
+}
+
+enum PipelineOutcome: Sendable {
+    case success
+    case failure
+    case cancelled
+}
+
+/// Runs the bundled Python engine off the main thread and supports cancel.
+final class PipelineRunner: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var onOutput: (@Sendable (String) -> Void)?
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        process?.terminate()
+        lock.unlock()
+    }
+
+    func run(_ request: PipelineRequest) -> PipelineOutcome {
+        lock.lock()
+        cancelled = false
+        lock.unlock()
+
+        var arguments = [
+            request.scriptURL.path,
+            "--mode", request.mode,
+            "--input", request.inputURL.path,
+            "--output-dir", request.outputDir.path,
+            "--resources", request.resourcesURL.path
+        ]
+        if let midi = request.outputMIDI, request.mode != "separate" {
+            arguments += ["--output-midi", midi.path]
+        }
+        if let start = request.start, let end = request.end {
+            arguments += ["--start", String(start), "--end", String(end)]
+        }
+
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
+        process.executableURL = request.pythonURL
         process.arguments = arguments
-        process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+        process.currentDirectoryURL = request.outputDir
 
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "PYTHONHOME")
@@ -573,31 +712,56 @@ struct ContentView: View {
         process.standardError = pipe
         let fileHandle = pipe.fileHandleForReading
 
-        fileHandle.readabilityHandler = { handle in
+        fileHandle.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                DispatchQueue.main.async {
-                    self.consoleOutput += output
-                    for line in output.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-                        if let range = line.range(of: "STEP:") {
-                            let message = String(line[range.upperBound...])
-                            self.currentStepMessage = message
-                            self.updatePhase(from: message)
-                        }
-                    }
-                }
+            guard !data.isEmpty, let output = String(data: data, encoding: .utf8), !output.isEmpty else {
+                return
             }
+            self?.onOutput?(output)
         }
+
+        lock.lock()
+        self.process = process
+        if cancelled {
+            lock.unlock()
+            fileHandle.readabilityHandler = nil
+            return .cancelled
+        }
+        lock.unlock()
 
         do {
             try process.run()
             process.waitUntilExit()
-            fileHandle.readabilityHandler = nil
-            return process.terminationStatus == 0
         } catch {
             fileHandle.readabilityHandler = nil
-            appendLog("System error: Could not launch process. Detail: \(error.localizedDescription)")
-            return false
+            onOutput?("System error: could not launch process. \(error.localizedDescription)\n")
+            return isCancelled ? .cancelled : .failure
+        }
+
+        fileHandle.readabilityHandler = nil
+        drainRemaining(fileHandle)
+
+        lock.lock()
+        self.process = nil
+        let wasCancelled = cancelled
+        lock.unlock()
+
+        if wasCancelled || process.terminationReason == .uncaughtSignal {
+            return .cancelled
+        }
+        return process.terminationStatus == 0 ? .success : .failure
+    }
+
+    private var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    private func drainRemaining(_ handle: FileHandle) {
+        let data = handle.readDataToEndOfFile()
+        if !data.isEmpty, let output = String(data: data, encoding: .utf8), !output.isEmpty {
+            onOutput?(output)
         }
     }
 }

@@ -7,11 +7,36 @@ import AVFoundation
 
 enum WaveformSampler {
     /// Downsampled peak amplitudes for a lightweight waveform preview.
+    /// Each bar maps to a contiguous time slice of the file (left → right = start → end).
     static func loadSamples(from url: URL, barCount: Int = 72) async -> [Float] {
         let asset = AVURLAsset(url: url)
         guard let track = try? await asset.loadTracks(withMediaType: .audio).first else {
             return placeholder(count: barCount)
         }
+
+        let durationSeconds: Double
+        do {
+            let time = try await asset.load(.duration)
+            durationSeconds = CMTimeGetSeconds(time)
+        } catch {
+            return placeholder(count: barCount)
+        }
+        guard durationSeconds.isFinite, durationSeconds > 0 else {
+            return placeholder(count: barCount)
+        }
+
+        var channelCount = 2
+        var sampleRate = 44100.0
+        let formatDescriptions = (try? await track.load(.formatDescriptions)) ?? []
+        for desc in formatDescriptions {
+            if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)?.pointee {
+                channelCount = max(1, Int(asbd.mChannelsPerFrame))
+                if asbd.mSampleRate > 0 {
+                    sampleRate = asbd.mSampleRate
+                }
+            }
+        }
+        let totalFrames = max(1, Int((durationSeconds * sampleRate).rounded(.up)))
 
         let reader: AVAssetReader
         do {
@@ -37,12 +62,11 @@ enum WaveformSampler {
         }
 
         var peaks = [Float](repeating: 0, count: barCount)
-        var sampleIndex = 0
-        var totalSamples = 0
+        var frameIndex = 0
 
         do {
             while let readySampleBuffer = try await provider.next() {
-                try readySampleBuffer.withUnsafeSampleBuffer { sampleBuffer in
+                readySampleBuffer.withUnsafeSampleBuffer { sampleBuffer in
                     guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
 
                     let length = CMBlockBufferGetDataLength(block)
@@ -52,15 +76,17 @@ enum WaveformSampler {
                         CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: base)
                     }
 
-                    let count = length / 2
+                    let sampleCount = length / MemoryLayout<Int16>.size
                     data.withUnsafeBytes { raw in
                         let samples = raw.bindMemory(to: Int16.self)
-                        for i in 0..<count {
-                            let bar = sampleIndex % barCount
+                        var i = 0
+                        while i < sampleCount {
+                            let frame = min(frameIndex, totalFrames - 1)
+                            let bar = min(barCount - 1, frame * barCount / totalFrames)
                             let normalized = abs(Float(samples[i]) / Float(Int16.max))
                             peaks[bar] = max(peaks[bar], normalized)
-                            sampleIndex += 1
-                            totalSamples += 1
+                            i += channelCount
+                            frameIndex += 1
                         }
                     }
                 }

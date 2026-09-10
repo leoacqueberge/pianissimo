@@ -10,12 +10,13 @@ import SwiftUI
 struct ModeCardPicker: View {
     @Binding var selection: AppMode
     var disabled: Bool
+    var onOpenPlayer: () -> Void
 
     @Environment(\.homeTheme) private var theme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Mode")
+            Text("Start from")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(theme.text)
 
@@ -23,11 +24,15 @@ struct ModeCardPicker: View {
                 ForEach(AppMode.allCases) { mode in
                     ModeCard(
                         mode: mode,
-                        isSelected: selection == mode,
+                        isSelected: mode != .playerOnly && selection == mode,
                         disabled: disabled
                     ) {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            selection = mode
+                        if mode == .playerOnly {
+                            onOpenPlayer()
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                selection = mode
+                            }
                         }
                     }
                 }
@@ -63,89 +68,17 @@ private struct ModeCard: View {
 
                 Spacer(minLength: 0)
 
-                if isSelected {
+                if mode == .playerOnly {
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(theme.subtleText)
+                } else if isSelected {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(theme.accent)
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(isSelected ? theme.accent.opacity(0.10) : theme.cardFill)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(isSelected ? theme.accent.opacity(0.45) : theme.cardStroke, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .disabled(disabled)
-    }
-}
-
-// MARK: - Audio source picker
-
-struct AudioSourcePicker: View {
-    @Binding var selection: AudioSourceType
-    var disabled: Bool
-
-    @Environment(\.homeTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Audio source")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(theme.text)
-
-            HStack(spacing: 8) {
-                ForEach(AudioSourceType.allCases) { source in
-                    AudioSourceButton(
-                        source: source,
-                        isSelected: selection == source,
-                        disabled: disabled
-                    ) {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            selection = source
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct AudioSourceButton: View {
-    let source: AudioSourceType
-    let isSelected: Bool
-    let disabled: Bool
-    let action: () -> Void
-
-    @Environment(\.homeTheme) private var theme
-
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: source.icon)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(isSelected ? theme.accent : theme.subtleText)
-
-                Text(source.title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-
-                Text(source.subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(theme.subtleText)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .minimumScaleFactor(0.8)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .padding(.horizontal, 8)
             .background(
                 RoundedRectangle(cornerRadius: 12)
                     .fill(isSelected ? theme.accent.opacity(0.10) : theme.cardFill)
@@ -208,15 +141,18 @@ struct AudioDropzone: View {
                     .font(.caption)
                     .foregroundStyle(theme.accent)
 
-                Text("click to change file")
+                Text("Click to change file")
                     .font(.caption2)
                     .foregroundStyle(theme.subtleText)
             } else {
-                Text("drop your song here")
+                Text("Drop your song here")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(theme.text)
                 Text("mp3 · wav · m4a · webm · mp4")
                     .font(.caption)
+                    .foregroundStyle(theme.subtleText)
+                Text("or drop a .mid to open the player")
+                    .font(.caption2)
                     .foregroundStyle(theme.subtleText)
             }
         }
@@ -585,19 +521,24 @@ struct WaveformBars: View {
 
 struct PipelineTimeline: View {
     let mode: AppMode
-    let sourceType: AudioSourceType
     let phase: ProcessingPhase
+    var failedAt: ProcessingPhase = .preparing
     let currentMessage: String
 
     @Environment(\.homeTheme) private var theme
 
-    private var steps: [String] { mode.pipelineLabels(sourceType: sourceType) }
+    private var steps: [String] { mode.pipelineLabels }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Progress")
-                .font(.headline)
-                .foregroundStyle(theme.text)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Progress")
+                    .font(.headline)
+                    .foregroundStyle(theme.text)
+                Text(mode.title)
+                    .font(.caption)
+                    .foregroundStyle(theme.subtleText)
+            }
 
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(steps.enumerated()), id: \.offset) { index, label in
@@ -609,22 +550,15 @@ struct PipelineTimeline: View {
                     )
                 }
             }
-
-            Spacer(minLength: 0)
-
-            privacyFooter
         }
     }
 
     private var activeStepIndex: Int {
         switch phase {
         case .idle: return 0
-        case .preparing: return 1
-        case .separating: return sourceType == .pianoOnly ? 1 : 1
-        case .transcribing: return sourceType == .pianoOnly ? 1 : 2
-        case .saving: return max(0, steps.count - 1)
         case .done: return steps.count
-        case .failed: return max(0, steps.count - 1)
+        case .failed: return mode.stepIndex(for: failedAt)
+        default: return mode.stepIndex(for: phase)
         }
     }
 
@@ -637,17 +571,6 @@ struct PipelineTimeline: View {
         return .pending
     }
 
-    private var privacyFooter: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "lock.shield")
-                .font(.caption)
-                .foregroundStyle(theme.subtleText)
-            Text("All your data is processed locally on your Mac. No data is collected. AI models run entirely on your machine.")
-                .font(.caption)
-                .foregroundStyle(theme.subtleText)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
 }
 
 enum PipelineStepState {
@@ -678,10 +601,10 @@ struct PipelineStepRow: View {
                 Text(label)
                     .font(.body.weight(state == .active ? .semibold : .regular))
                     .foregroundStyle(state == .pending ? theme.subtleText : theme.text)
-                if let detail, state == .active {
+                if let detail, state == .active || state == .failed {
                     Text(detail)
                         .font(.subheadline)
-                        .foregroundStyle(theme.accent)
+                        .foregroundStyle(state == .failed ? Color.red : theme.accent)
                         .transition(.opacity)
                 }
             }
@@ -711,105 +634,30 @@ struct PipelineStepRow: View {
     }
 }
 
-// MARK: - Player mode panel
+// MARK: - Privacy chip
 
-struct PlayerModePanel: View {
-    let onOpenMIDI: () -> Void
-    let onOpenEmpty: () -> Void
-
+struct PrivacyChip: View {
     @Environment(\.homeTheme) private var theme
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "play.rectangle.on.rectangle")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(theme.accent)
-
-            Text("learn and play")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(theme.text)
-            Text("open an existing midi score in the visualizer.")
+        HStack(spacing: 6) {
+            Image(systemName: "lock.shield.fill")
                 .font(.caption)
-                .foregroundStyle(theme.subtleText)
-                .multilineTextAlignment(.center)
-
-            Button("open midi file…", action: onOpenMIDI)
-                .buttonStyle(.borderedProminent)
-                .tint(theme.accent)
-
-            Button("open empty player", action: onOpenEmpty)
-                .buttonStyle(.borderless)
-                .font(.caption)
-                .foregroundStyle(theme.subtleText)
+            Text("Processed locally on your Mac")
+                .font(.caption.weight(.medium))
         }
-        .frame(maxWidth: .infinity, minHeight: 148)
-        .padding(18)
+        .foregroundStyle(theme.subtleText)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(theme.dropzoneFill)
+            Capsule()
+                .fill(theme.cardFill)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 14)
+            Capsule()
                 .strokeBorder(theme.cardStroke, lineWidth: 1)
         )
-    }
-}
-
-// MARK: - Recent files
-
-struct RecentFilesSection: View {
-    let audioFiles: [URL]
-    let midiFiles: [URL]
-    let onSelectAudio: (URL) -> Void
-    let onSelectMIDI: (URL) -> Void
-
-    @Environment(\.homeTheme) private var theme
-
-    var body: some View {
-        if !audioFiles.isEmpty || !midiFiles.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Recent")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(theme.text)
-
-                if !audioFiles.isEmpty {
-                    recentGroup(title: "Audio", files: audioFiles, icon: "waveform", onSelect: onSelectAudio)
-                }
-                if !midiFiles.isEmpty {
-                    recentGroup(title: "MIDI", files: midiFiles, icon: "pianokeys", onSelect: onSelectMIDI)
-                }
-            }
-        }
-    }
-
-    private func recentGroup(
-        title: String,
-        files: [URL],
-        icon: String,
-        onSelect: @escaping (URL) -> Void
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(theme.subtleText)
-            ForEach(files, id: \.path) { url in
-                Button {
-                    onSelect(url)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: icon)
-                            .font(.caption)
-                            .foregroundStyle(theme.accent)
-                        Text(url.lastPathComponent)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .foregroundStyle(theme.text)
-                        Spacer()
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-        }
+        .help("All your data is processed locally. No data is collected. AI models run entirely on your machine.")
     }
 }
 
@@ -828,7 +676,7 @@ struct LogsOverlay: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(theme.subtleText)
                 Spacer()
-                Button("clear") { text = "" }
+                Button("Clear") { text = "" }
                     .buttonStyle(.borderless)
                     .font(.caption)
                 Button {
@@ -841,7 +689,7 @@ struct LogsOverlay: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    Text(text.isEmpty ? "waiting for a task…\n" : text)
+                    Text(text.isEmpty ? "Waiting for a task…\n" : text)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(theme.text)
                         .textSelection(.enabled)
@@ -867,87 +715,5 @@ struct LogsOverlay: View {
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(theme.cardStroke, lineWidth: 1)
         )
-    }
-}
-
-// MARK: - Idle right panel (mode description)
-
-struct ModeInfoPanel: View {
-    let mode: AppMode
-
-    @Environment(\.homeTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 40) {
-            Spacer(minLength: 0)
-
-            VStack(spacing: 0) {
-                ForEach(Array(mode.infoSteps.enumerated()), id: \.offset) { index, step in
-                    SplashStepRow(
-                        icon: step.icon,
-                        title: step.title,
-                        detail: step.detail,
-                        isLast: index == mode.infoSteps.count - 1
-                    )
-                }
-            }
-
-            Spacer(minLength: 0)
-
-            HStack(alignment: .center, spacing: 8) {
-                Image(systemName: "info.circle")
-                    .font(.system(.caption2))
-                    .foregroundStyle(theme.subtleText)
-                Text("All your data is processed locally on your Mac. No data is collected. AI models run entirely on your machine.")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(theme.subtleText)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-}
-
-struct SplashStepRow: View {
-    let icon: String
-    let title: String
-    let detail: String
-    let isLast: Bool
-
-    @Environment(\.homeTheme) private var theme
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 14) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(title)
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(theme.text)
-                    Text(detail)
-                        .font(.body)
-                        .foregroundStyle(theme.subtleText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 8)
-
-                Image(systemName: icon)
-                    .font(.system(size: 22, weight: .light))
-                    .foregroundStyle(theme.accent)
-                    .frame(width: 28, height: 28)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(theme.cardStroke, lineWidth: 1)
-            )
-
-            if !isLast {
-                Rectangle()
-                    .fill(theme.cardStroke)
-                    .frame(width: 1, height: 16)
-            }
-        }
     }
 }

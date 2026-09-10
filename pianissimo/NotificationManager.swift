@@ -10,7 +10,7 @@ import UserNotifications
 
 enum NotificationManager {
 
-    /// Demande l'autorisation d'envoyer des notifications (à appeler au lancement).
+    /// Demande l'autorisation d'envoyer des notifications (au moment où un traitement démarre).
     static func requestAuthorization() {
         UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound]) { _, _ in }

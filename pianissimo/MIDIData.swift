@@ -9,6 +9,22 @@
 
 import Foundation
 
+/// Noms français des notes (solfège).
+enum PitchName {
+    private static let names = ["Do", "Do♯", "Ré", "Ré♯", "Mi", "Fa", "Fa♯", "Sol", "Sol♯", "La", "La♯", "Si"]
+
+    /// Nom solfège sans octave (ex. "Ré", "Fa♯").
+    static func solfege(_ pitch: Int) -> String {
+        names[((pitch % 12) + 12) % 12]
+    }
+
+    /// Nom avec octave piano (Do1 = MIDI 24). Ex. "Do4", "La♯2".
+    static func withOctave(_ pitch: Int) -> String {
+        let octave = (pitch / 12) - 1
+        return "\(solfege(pitch))\(octave)"
+    }
+}
+
 /// Une note jouable, exprimée en secondes (prête pour l'affichage et la synchro).
 struct MIDINote: Identifiable, Equatable {
     let id = UUID()
@@ -21,10 +37,23 @@ struct MIDINote: Identifiable, Equatable {
     var end: Double { start + duration }
 }
 
+struct MIDITempoEvent: Equatable {
+    var tick: Int
+    var usPerQuarter: Int
+}
+
+struct MIDITempoMap: Equatable {
+    var ppq: Double
+    var events: [MIDITempoEvent]
+
+    static let standard120 = MIDITempoMap(ppq: 480, events: [MIDITempoEvent(tick: 0, usPerQuarter: 500_000)])
+}
+
 /// Résultat du parsing d'un fichier MIDI.
 struct ParsedMIDI {
     var notes: [MIDINote]
     var duration: Double
+    var tempoMap: MIDITempoMap
 }
 
 enum MIDIParseError: LocalizedError {
@@ -87,7 +116,7 @@ enum MIDIFile {
 
         struct RawNote { var pitch: Int; var onTick: Int; var offTick: Int; var velocity: Int; var track: Int }
         var rawNotes: [RawNote] = []
-        var tempoEvents: [(tick: Int, usPerQuarter: Int)] = []
+        var tempoEvents: [MIDITempoEvent] = []
         var maxTick = 0
 
         for trackIndex in 0..<numTracks {
@@ -137,7 +166,7 @@ enum MIDIFile {
                     try need(len)
                     if metaType == 0x51, len == 3 {
                         let us = (Int(bytes[cursor]) << 16) | (Int(bytes[cursor + 1]) << 8) | Int(bytes[cursor + 2])
-                        tempoEvents.append((tick: absTick, usPerQuarter: us))
+                        tempoEvents.append(MIDITempoEvent(tick: absTick, usPerQuarter: us))
                     }
                     cursor += len
                     runningStatus = 0
@@ -216,16 +245,20 @@ enum MIDIFile {
         notes.sort { $0.start < $1.start }
 
         let totalDuration = max(notes.map { $0.end }.max() ?? 0, ticksToSeconds(maxTick))
-        return ParsedMIDI(notes: notes, duration: totalDuration)
+        return ParsedMIDI(
+            notes: notes,
+            duration: totalDuration,
+            tempoMap: MIDITempoMap(ppq: ppq, events: tempoEvents)
+        )
     }
 
     private struct TempoSeg { let tick: Int; let sec: Double; let usPerQ: Double }
 
-    private static func buildTempoSegments(_ events: [(tick: Int, usPerQuarter: Int)],
+    private static func buildTempoSegments(_ events: [MIDITempoEvent],
                                            ppq: Double) -> [TempoSeg] {
         var evs = events.sorted { $0.tick < $1.tick }
         if evs.first?.tick != 0 {
-            evs.insert((tick: 0, usPerQuarter: 500_000), at: 0) // 120 BPM par défaut
+            evs.insert(MIDITempoEvent(tick: 0, usPerQuarter: 500_000), at: 0) // 120 BPM par défaut
         }
         var segs: [TempoSeg] = []
         for (i, e) in evs.enumerated() {
@@ -238,5 +271,106 @@ enum MIDIFile {
             }
         }
         return segs
+    }
+
+    /// Écrit un fichier MIDI Type 0. Conserve la carte de tempo d'origine si elle est fournie
+    /// (les durées restent en secondes, reconverties en ticks).
+    static func write(notes: [MIDINote], to url: URL, tempoMap: MIDITempoMap? = nil) throws {
+        let map = tempoMap ?? .standard120
+        let ppq = max(1, Int(map.ppq.rounded()))
+        let segs = buildTempoSegments(map.events, ppq: Double(ppq))
+
+        func secondsToTicks(_ s: Double) -> Int {
+            var chosen = segs[0]
+            for seg in segs {
+                if seg.sec <= s { chosen = seg } else { break }
+            }
+            let ticks = Double(chosen.tick) + (s - chosen.sec) * 1_000_000.0 * Double(ppq) / chosen.usPerQ
+            return max(0, Int(ticks.rounded()))
+        }
+
+        struct Event {
+            var tick: Int
+            var bytes: [UInt8]
+            var isNoteOff: Bool
+        }
+
+        var events: [Event] = []
+        events.reserveCapacity(notes.count * 2 + map.events.count)
+
+        var tempos = map.events.sorted { $0.tick < $1.tick }
+        if tempos.first?.tick != 0 {
+            tempos.insert(MIDITempoEvent(tick: 0, usPerQuarter: 500_000), at: 0)
+        }
+        for tempo in tempos {
+            let us = tempo.usPerQuarter
+            events.append(Event(
+                tick: max(0, tempo.tick),
+                bytes: [0xFF, 0x51, 0x03,
+                        UInt8((us >> 16) & 0xFF),
+                        UInt8((us >> 8) & 0xFF),
+                        UInt8(us & 0xFF)],
+                isNoteOff: false
+            ))
+        }
+
+        for note in notes {
+            let on = secondsToTicks(note.start)
+            let off = max(on + 1, secondsToTicks(note.end))
+            let pitch = UInt8(clamping: note.pitch)
+            let vel = UInt8(clamping: min(127, max(1, note.velocity)))
+            events.append(Event(tick: on, bytes: [0x90, pitch, vel], isNoteOff: false))
+            events.append(Event(tick: off, bytes: [0x80, pitch, 0], isNoteOff: true))
+        }
+        events.sort {
+            if $0.tick != $1.tick { return $0.tick < $1.tick }
+            // Note-off avant note-on au même tick pour éviter les chevauchements parasites.
+            return $0.isNoteOff && !$1.isNoteOff
+        }
+
+        let endTick = events.map(\.tick).max() ?? 0
+
+        func appendVarLen(_ value: Int, to data: inout Data) {
+            var buffer: [UInt8] = []
+            var v = max(0, value)
+            buffer.append(UInt8(v & 0x7F))
+            v >>= 7
+            while v > 0 {
+                buffer.append(UInt8((v & 0x7F) | 0x80))
+                v >>= 7
+            }
+            for b in buffer.reversed() { data.append(b) }
+        }
+
+        var track = Data()
+        var lastTick = 0
+        for e in events {
+            appendVarLen(e.tick - lastTick, to: &track)
+            track.append(contentsOf: e.bytes)
+            lastTick = e.tick
+        }
+
+        // End of track
+        appendVarLen(max(0, endTick - lastTick), to: &track)
+        track.append(contentsOf: [0xFF, 0x2F, 0x00])
+
+        var data = Data()
+        // MThd
+        data.append(contentsOf: [0x4D, 0x54, 0x68, 0x64])
+        data.append(contentsOf: [0x00, 0x00, 0x00, 0x06]) // header length
+        data.append(contentsOf: [0x00, 0x00])             // format 0
+        data.append(contentsOf: [0x00, 0x01])             // 1 track
+        data.append(contentsOf: [UInt8((ppq >> 8) & 0xFF), UInt8(ppq & 0xFF)])
+
+        // MTrk
+        data.append(contentsOf: [0x4D, 0x54, 0x72, 0x6B])
+        let len = track.count
+        data.append(contentsOf: [
+            UInt8((len >> 24) & 0xFF), UInt8((len >> 16) & 0xFF),
+            UInt8((len >> 8) & 0xFF), UInt8(len & 0xFF)
+        ])
+        data.append(track)
+
+        try data.write(to: url, options: .atomic)
     }
 }
